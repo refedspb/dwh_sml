@@ -259,7 +259,7 @@ docker-compose exec clickhouse clickhouse-client --user analytics --password ana
 
 ![DAG Airflow: четыре задачи успешны, sync_clickhouse пропущена](docs/airflow-dag-run.png)
 
-![[docs/superset.png]]
+![Superset](docs/superset.png)
 
 
 ## Структура репозитория
