@@ -1,0 +1,197 @@
+# Базовый запуск:   docker-compose up
+#   postgres -> source-init (schema.sql + synthetic.sql) -> pipeline (ETL -> витрины -> ML)
+# Extra (профили, по умолчанию не запускаются; все файлы лежат в extra/):
+#   docker-compose --profile clickhouse up   # + ClickHouse и перенос витрин
+#   docker-compose --profile airflow up      # + Airflow (UI на 127.0.0.1:18080)
+#   docker-compose --profile superset up     # + Superset с готовым дашбордом (UI на 127.0.0.1:18088)
+#   docker-compose --profile extra up        # всё вместе
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+    ports:
+      - "127.0.0.1:${PG_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  source-init:
+    image: postgres:17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-deals_bigdata}
+      N_PRICES: ${N_PRICES:-300000}
+    volumes:
+      - ./sql:/sql:ro
+    entrypoint: ["bash", "/sql/init_source.sh"]
+    restart: "no"
+
+  pipeline:
+    build: .
+    depends_on:
+      source-init:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-deals_bigdata}
+      AS_OF: ${AS_OF:-2026-10-26}
+      START_DATE: ${START_DATE:-}
+      END_DATE: ${END_DATE:-}
+      RANDOM_SEED: ${RANDOM_SEED:-42}
+      ML_MODELS: ${ML_MODELS:-catboost,ridge,tree}
+    volumes:
+      - ./artifacts:/app/artifacts
+    command: ["sh", "-c", "python -m etl.pipeline all && python -m ml.train_score"]
+    restart: "no"
+
+  # ---------------------------------------------------------------- extra: ClickHouse
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    profiles: ["clickhouse", "extra"]
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-analytics}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analytics}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+    ports:
+      - "127.0.0.1:${CLICKHOUSE_HTTP_PORT:-18123}:8123"
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  clickhouse-sync:
+    build: .
+    profiles: ["clickhouse", "extra"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      pipeline:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-deals_bigdata}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-analytics}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analytics}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+    command: ["python", "-m", "extra.clickhouse_sync"]
+    restart: "no"
+
+  # ---------------------------------------------------------------- extra: Airflow
+  airflow:
+    build:
+      context: .
+      dockerfile: extra/Dockerfile.airflow
+    profiles: ["airflow", "extra"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      source-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-demo-only-secret}
+      PYTHONDONTWRITEBYTECODE: "1"
+      ARTIFACTS_DIR: /opt/airflow/artifacts
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-deals_bigdata}
+      AS_OF: ${AS_OF:-2026-10-26}
+      RANDOM_SEED: ${RANDOM_SEED:-42}
+      ML_MODELS: ${ML_MODELS:-catboost,ridge,tree}
+      ENABLE_CLICKHOUSE_SYNC: ${ENABLE_CLICKHOUSE_SYNC:-0}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-analytics}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analytics}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-18080}:8080"
+    volumes:
+      - ./extra/airflow_dag.py:/opt/airflow/dags/smart_logistics_dag.py:ro
+      - ./:/opt/airflow/project:ro
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+        airflow scheduler &
+        exec airflow webserver --port 8080
+
+  # ---------------------------------------------------------------- extra: Superset
+  # Образ с драйвером PostgreSQL (в базовом apache/superset его нет). superset-init готовит метаданные
+  # и создаёт дашборд изнутри контейнера; superset поднимает веб-сервер на тех же данных.
+  superset-init:
+    build:
+      context: .
+      dockerfile: extra/Dockerfile.superset
+    profiles: ["superset", "extra"]
+    depends_on:
+      pipeline:
+        condition: service_completed_successfully
+    environment: &superset_env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-demo-only-secret-change-me}
+      SUPERSET_ADMIN_USER: admin
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      PGDATABASE: ${POSTGRES_DB:-deals_bigdata}
+    volumes:
+      - supersethome:/app/superset_home
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        superset db upgrade
+        superset fab create-admin --username admin --firstname Admin --lastname User \
+          --email admin@example.com --password admin || true
+        superset init
+        python /app/bootstrap.py
+    restart: "no"
+
+  superset:
+    build:
+      context: .
+      dockerfile: extra/Dockerfile.superset
+    profiles: ["superset", "extra"]
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    environment: *superset_env
+    ports:
+      - "127.0.0.1:${SUPERSET_PORT:-18088}:8088"
+    volumes:
+      - supersethome:/app/superset_home
+
+volumes:
+  pgdata:
+  chdata:
+  supersethome:
